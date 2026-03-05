@@ -1,23 +1,14 @@
 #!/bin/bash
 # ==============================================================================
-# layla.sh — C2 Beacon Detection & Traffic Tracer
+# beacon-monitor.sh — C2 Beacon Detection & Traffic Tracer
 # Blue team / CCDC defensive tool
 #
-#                     .---.        ____       ____     __  .---.        ____     
-#                     | ,_|      .'  __ `.    \   \   /  / | ,_|      .'  __ `.  
-#                   ,-./  )     /   '  \  \    \  _. /  ',-./  )     /   '  \  \ 
-#                   \  '_ '`)   |___|  /  |     _( )_ .' \  '_ '`)   |___|  /  | 
-#                    > (_)  )      _.-`   | ___(_ o _)'   > (_)  )      _.-`   | 
-#                   (  .  .-'   .'   _    ||   |(_,_)'   (  .  .-'   .'   _    | 
-#                    `-'`-'|___ |  _( )_  ||   `-'  /     `-'`-'|___ |  _( )_  | 
-#                     |        \\ (_ o _) / \      /       |        \\ (_ o _) / 
-#                     `--------` '.(_,_).'   `-..-'        `--------` '.(_,_).'  
 # Detects:
 #   - Beaconing patterns (periodic connections to same dst, NOT established)
 #   - DNS traffic / DNS tunneling indicators
 #   - HTTP C2 (Host headers, URIs)
 #   - HTTPS C2 (TLS SNI from ClientHello)
-#   - Suspicious port traffic (common Sliver/CS/Metasploit ports)
+#   - Suspicious port traffic (all TCP/UDP ports monitored; known C2 ports get priority alerts)
 #
 # Usage:
 #   sudo ./beacon-monitor.sh [OPTIONS]
@@ -28,29 +19,11 @@
 #   -w <seconds>     Beacon detection window (default: 120s)
 #   -t <count>       Connections to same dst to flag as beacon (default: 3)
 #   -p <seconds>     Connection poll interval (default: 5s)
-#   -r <low>-<high>  Port range to monitor for outbound connections (default: 1-65535)
-#   -n <cidr>        Internal network CIDR to exclude from outbound alerts (default: auto-detect RFC1918)
+#   -f <ports>       Force-alert on specific ports regardless of range (e.g. 80,443 for C2-over-HTTP/S)
 #   -a <file>        Also write all alerts to this specific file (e.g. /var/log/c2-alerts.log)
 #   -v               Verbose output to stdout
 #   -h               Show this help
 # ==============================================================================
-#
-# Note:
-#   Detection contains false positives. Files will be reported only when they are noticable, ie not deleted.
-#   It will not reveal the source of the persistence executing the beacon. That requires investigation.
-#   The investigation should be trivial; You have the file name. You have the find and grep command.
-cat << 'EOF'
-  .---.        ____       ____     __  .---.        ____     
-  | ,_|      .'  __ \`.    \   \   /  / | ,_|      .'  __ \`.
-,-./  )     /   '  \  \    \  _. /  ',-./  )     /   '  \  \ 
-\  '_ '`)   |___|  /  |     _( )_ .' \  '_ '`)   |___|  /  | 
- > (_)  )      _.-`   | ___(_ o _)'   > (_)  )      _.-`   | 
-(  .  .-'   .'   _    ||   |(_,_)'   (  .  .-'   .'   _    | 
- `-'`-'|___ |  _( )_  ||   `-'  /     `-'`-'|___ |  _( )_  | 
-  |        \\ (_ o _) / \      /       |        \\ (_ o _) / 
-  `--------` '.(_,_).'   `-..-'        `--------` '.(_,_).'  
-EOF
-
 
 set -uo pipefail
 
@@ -62,12 +35,17 @@ OUTPUT_DIR="./beacon-logs"
 BEACON_WINDOW=120        # seconds to accumulate connection events per dst
 BEACON_THRESHOLD=3       # repeated contacts to same dst:port to flag
 POLL_INTERVAL=5          # ss polling interval in seconds
-PORT_RANGE="1-65535"    # outbound port range to monitor (low-high)
-INTERNAL_NET=""        # CIDR of internal net; auto-detected if empty
-ALERT_FILE=""          # optional: also write alerts to a specific file path
+EXTRA_PORTS=""
+ALERT_FILE=""       # optional: also write alerts to a specific file path
 VERBOSE=false
 
-# Sliver-specific indicators (DNS patterns still used by DNS monitor)
+# Port range that triggers alerts — default: all non-privileged ports (1024-65535)
+# Use -f to force-alert on ports below this range (e.g. 80, 443)
+ALERT_PORT_MIN=1024
+ALERT_PORT_MAX=65535
+
+# Sliver-specific indicators
+SLIVER_PORTS="80 443 8080 8443 8888 31337"
 SLIVER_DNS_PATTERNS="(implant|beacon|agent|stage|sl[0-9a-f]{8})"
 
 # ---------------------------------------------------------------------------- #
@@ -78,15 +56,14 @@ usage() {
     exit 0
 }
 
-while getopts "i:o:w:t:p:r:n:a:vh" opt; do
+while getopts "i:o:w:t:p:f:a:vh" opt; do
     case $opt in
         i) IFACE="$OPTARG" ;;
         o) OUTPUT_DIR="$OPTARG" ;;
         w) BEACON_WINDOW="$OPTARG" ;;
         t) BEACON_THRESHOLD="$OPTARG" ;;
         p) POLL_INTERVAL="$OPTARG" ;;
-        r) PORT_RANGE="$OPTARG" ;;
-        n) INTERNAL_NET="$OPTARG" ;;
+        f) EXTRA_PORTS="$OPTARG" ;;
         a) ALERT_FILE="$OPTARG" ;;
         v) VERBOSE=true ;;
         h) usage ;;
@@ -115,30 +92,13 @@ if [[ -n "$ALERT_FILE" ]]; then
     echo "# C2 Beacon Alerts — started $(ts)" >> "$ALERT_FILE"
 fi
 
-# Parse port range
-PORT_RANGE_LOW="${PORT_RANGE%-*}"
-PORT_RANGE_HIGH="${PORT_RANGE#*-}"
-if ! [[ "$PORT_RANGE_LOW" =~ ^[0-9]+$ && "$PORT_RANGE_HIGH" =~ ^[0-9]+$ ]]; then
-    echo "[!] Invalid port range: $PORT_RANGE  (expected format: low-high, e.g. 1024-65535)"
-    exit 1
+# Build force-alert port list from -f flag (ports to alert on regardless of range)
+FORCE_ALERT_PORTS=""
+FORCE_ALERT_REGEX=""
+if [[ -n "$EXTRA_PORTS" ]]; then
+    FORCE_ALERT_PORTS=$(echo "$EXTRA_PORTS" | tr ',' ' ')
+    FORCE_ALERT_REGEX="^($(echo "$FORCE_ALERT_PORTS" | tr ' ' '|'))$"
 fi
-
-# Auto-detect internal network CIDR if not provided
-if [[ -z "$INTERNAL_NET" ]]; then
-    INTERNAL_NET=$(ip -o -f inet addr show "$IFACE" 2>/dev/null | awk '{print $4}' | head -1)
-    [[ -z "$INTERNAL_NET" ]] && INTERNAL_NET="0.0.0.0/0"  # fallback: treat everything as external
-fi
-
-# Build BPF filter: outbound SYN-only packets in port range, dst not on internal net
-# SYN-only (tcp[13]=2) means new connection attempts — one event per beacon callback, not per packet
-OUTBOUND_BPF="tcp portrange ${PORT_RANGE_LOW}-${PORT_RANGE_HIGH} \
-    and tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack == 0 \
-    and not dst net ${INTERNAL_NET} \
-    and not dst net 127.0.0.0/8"
-
-# tshark display filter equivalent (applied on top of BPF)
-OUTBOUND_DFILTER="tcp.flags.syn==1 && tcp.flags.ack==0 \
-    && tcp.dstport >= ${PORT_RANGE_LOW} && tcp.dstport <= ${PORT_RANGE_HIGH}"
 
 # Create output directory structure
 mkdir -p "$OUTPUT_DIR"/{dns,http,https,c2ports,connections,beacons,pcap}
@@ -227,8 +187,9 @@ cat <<EOF
   Beacon window:    ${BEACON_WINDOW}s
   Beacon threshold: ${BEACON_THRESHOLD} contacts
   Poll interval:    ${POLL_INTERVAL}s
-  Port range:       ${PORT_RANGE_LOW}-${PORT_RANGE_HIGH}
-  Internal net:     $INTERNAL_NET (excluded from outbound alerts)
+  Port coverage:    all TCP/UDP ports 1-65535 (DNS handled by DNS monitor)
+  Alert range:      ports ${ALERT_PORT_MIN}-${ALERT_PORT_MAX}
+  Force-alert ports:${FORCE_ALERT_PORTS:-" (none — use -f to add specific ports)"}
   tshark available: $HAS_TSHARK
   tcpdump avail:    $HAS_TCPDUMP
   Alert file:       ${ALERT_FILE:-"(none — use -a <file>)"}
@@ -437,9 +398,8 @@ start_https_monitor() {
 }
 
 # ---------------------------------------------------------------------------- #
-# 4. Outbound Connection Monitor
-#    Alerts on ANY outbound TCP SYN to an external IP in the configured port range.
-#    Since no outbound connections should exist, every hit is a beacon candidate.
+# 4. Suspicious Port Monitor
+#    Watches for traffic on known C2/implant ports
 # ---------------------------------------------------------------------------- #
 
 # Resolve the process/exe owning a src IP:port connection via ss.
@@ -466,49 +426,68 @@ lookup_proc() {
 }
 
 start_c2port_monitor() {
-    log INFO "Starting outbound connection monitor -> $LOG_C2"
+    log INFO "Starting full-range port monitor (all TCP/UDP) -> $LOG_C2"
 
-    echo "# Outbound Connection Monitor — $(ts) — Interface: $IFACE" > "$LOG_C2"
-    echo "# Port range: ${PORT_RANGE_LOW}-${PORT_RANGE_HIGH}  |  Internal net (excluded): $INTERNAL_NET" >> "$LOG_C2"
-    echo "# Every entry is an OUTBOUND SYN to an external IP — should not exist in a locked-down env" >> "$LOG_C2"
-    echo "# FORMAT: timestamp|src_ip:port -> dst_ip:port|proc_info" >> "$LOG_C2"
+    echo "# Port Monitor — $(ts) — Interface: $IFACE" > "$LOG_C2"
+    echo "# Coverage: all TCP/UDP ports 1-65535 (port 53/DNS handled by DNS monitor)" >> "$LOG_C2"
+    echo "# Alert range: ports ${ALERT_PORT_MIN}-${ALERT_PORT_MAX} | Force-alert: ${FORCE_ALERT_PORTS:-none}" >> "$LOG_C2"
+    echo "# FORMAT: timestamp|label|src_ip:port|dst_ip:port|protocol|size|proc_info" >> "$LOG_C2"
+
+    # Capture all TCP/UDP — exclude port 53 (handled by dedicated DNS monitor)
+    PORT_FILTER="(tcp or udp) and not port 53"
 
     if $HAS_TSHARK; then
         tshark -i "$IFACE" -l -n \
-            -f "$OUTBOUND_BPF" \
-            -Y "$OUTBOUND_DFILTER" \
+            -f "$PORT_FILTER" \
             -T fields \
             -e frame.time_epoch \
             -e ip.src \
             -e ip.dst \
             -e tcp.srcport \
             -e tcp.dstport \
+            -e udp.srcport \
+            -e udp.dstport \
+            -e frame.protocols \
+            -e frame.len \
             -E separator='|' \
             2>/dev/null | \
-        while IFS='|' read -r _ts src_ip dst_ip src_port dst_port; do
+        while IFS='|' read -r ts src_ip dst_ip tcp_sport tcp_dport udp_sport udp_dport protos len; do
+            src_port="${tcp_sport:-$udp_sport}"
+            dst_port="${tcp_dport:-$udp_dport}"
             proc_info=$(lookup_proc "$src_ip" "$src_port")
-            msg="OUTBOUND-SYN: $src_ip:$src_port -> $dst_ip:$dst_port | $proc_info"
-            echo "[$(ts)] $msg" >> "$LOG_C2"
-            alert "$msg"
+            if (( dst_port >= ALERT_PORT_MIN && dst_port <= ALERT_PORT_MAX )) || \
+               { [[ -n "$FORCE_ALERT_REGEX" ]] && [[ "$dst_port" =~ $FORCE_ALERT_REGEX ]]; }; then
+                msg="HIGH-PORT: $src_ip:$src_port -> $dst_ip:$dst_port | $protos | ${len}B | $proc_info"
+                echo "[$(ts)] $msg" >> "$LOG_C2"
+                alert "$msg"
+            else
+                echo "[$(ts)] TRAFFIC: $src_ip:$src_port -> $dst_ip:$dst_port | $protos | ${len}B | $proc_info" >> "$LOG_C2"
+            fi
         done &
     else
-        # -nn: numeric IPs and ports; BPF limits to outbound SYN in port range
-        tcpdump -i "$IFACE" -l -nn -tttt "$OUTBOUND_BPF" 2>/dev/null | \
+        # -nn: suppress both hostname AND port-name resolution so we get numeric ports
+        tcpdump -i "$IFACE" -l -nn -tttt "$PORT_FILTER" 2>/dev/null | \
         while read -r _date _time _proto src_addr _arrow dst_addr rest; do
+            # tcpdump format: DATE TIME IP src.port > dst.port: ...
             src_ip="${src_addr%.*}"
             src_port="${src_addr##*.}"
             dst_ip="${dst_addr%.*}"
             dst_port="${dst_addr##*.}"
-            dst_port="${dst_port%:}"
+            dst_port="${dst_port%:}"   # strip trailing colon
             proc_info=$(lookup_proc "$src_ip" "$src_port")
-            msg="OUTBOUND-SYN: $src_ip:$src_port -> $dst_ip:$dst_port | $proc_info"
-            echo "[$(ts)] $msg" >> "$LOG_C2"
-            alert "$msg"
+            if (( dst_port >= ALERT_PORT_MIN && dst_port <= ALERT_PORT_MAX )) || \
+               { [[ -n "$FORCE_ALERT_REGEX" ]] && [[ "$dst_port" =~ $FORCE_ALERT_REGEX ]]; }; then
+                msg="HIGH-PORT: $src_ip:$src_port -> $dst_ip:$dst_port | $proc_info | $rest"
+                echo "[$(ts)] $msg" >> "$LOG_C2"
+                alert "$msg"
+            else
+                echo "[$(ts)] TRAFFIC: $src_ip:$src_port -> $dst_ip:$dst_port | $proc_info | $rest" >> "$LOG_C2"
+            fi
         done &
     fi
 
     CHILD_PIDS+=($!)
-    log INFO "Outbound monitor PID: $!"
+    log INFO "Port monitor PID: $!"
 }
 
 # ---------------------------------------------------------------------------- #
@@ -536,33 +515,28 @@ start_connection_monitor() {
             NOW=$(date +%s)
 
             if $HAS_SS; then
-                # Capture outbound TCP connections in non-ESTABLISHED states.
-                # is_internal() returns 1 for RFC1918/loopback addresses — we skip those
-                # as they are not outbound C2 candidates.
+                # Capture all TCP connections — focus on non-ESTABLISHED outbound
                 ss -tunap 2>/dev/null | awk '
-                function is_internal(ip,    a) {
-                    split(ip, a, ".")
-                    if (a[1] == 10) return 1
-                    if (a[1] == 127) return 1
-                    if (a[1] == 172 && a[2]+0 >= 16 && a[2]+0 <= 31) return 1
-                    if (a[1] == 192 && a[2] == 168) return 1
-                    return 0
-                }
                 NR > 1 {
                     proto=$1; state=$2; src=$5; dst=$6; proc=$7
-                    split(dst, d, ":")
-                    dst_ip=d[1]
-
-                    # Only care about connections going to external IPs
-                    if (is_internal(dst_ip)) next
-
-                    # Flag all non-ESTABLISHED outbound (SYN_SENT is the key beacon state)
+                    # Skip purely ESTABLISHED (those are normal sessions)
+                    # We want SYN-SENT, TIME-WAIT, CLOSE-WAIT, FIN-WAIT
                     if (state != "ESTABLISHED" && state != "LISTEN") {
                         print proto"|"state"|"src"|"dst"|"proc
                     }
-                    # Also flag ESTABLISHED sessions to external IPs (persistent C2 sessions)
+                    # Also include ESTABLISHED connections to suspicious ports
                     if (state == "ESTABLISHED") {
-                        print proto"|ESTABLISHED-EXTERNAL|"src"|"dst"|"proc
+                        split(dst, d, ":")
+                        port=d[length(d)]
+                        if (port+0 > 0) {
+                            # Flag non-standard high ports in ESTABLISHED state
+                            if ((port > 1024 && port != 8080 && port != 8443 &&
+                                 port != 443 && port != 80 && port != 22 &&
+                                 port != 25 && port != 587 && port != 993) &&
+                                proto == "tcp") {
+                                print proto"|ESTABLISHED-SUSPICIOUS|"src"|"dst"|"proc
+                            }
+                        }
                     }
                 }'
             elif $HAS_NETSTAT; then
@@ -765,7 +739,7 @@ echo "[*] Logs:"
 echo "    DNS:         $LOG_DNS"
 echo "    HTTP:        $LOG_HTTP"
 echo "    HTTPS/TLS:   $LOG_HTTPS"
-echo "    C2 Ports:    $LOG_C2"
+echo "    Port traffic: $LOG_C2"
 echo "    Connections: $LOG_CONNS"
 echo "    Beacons:     $LOG_BEACONS"
 echo "    Summary:     $LOG_SUMMARY"
