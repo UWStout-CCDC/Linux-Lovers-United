@@ -33,3 +33,9 @@ Runs an NFT script with all necessary ports for scoring inbound allowed and ever
 
 ### weak_nft.sh
 Runs an NFT script with all necessary ports for scoring inbound and DNS/HTTP/HTTPS outbound. This is weak as beacons will not be blocked.
+
+### strong_db_nft.sh
+Runs an NFT script with all necessary ports for scoring inbound allowed and everything else blocked. This allows for scoring and contains potential beacons on a system. This allows for external database connections.
+
+### weak_db_nft.sh
+Runs an NFT script with all necessary ports for scoring inbound and DNS/HTTP/HTTPS outbound. This is weak as beacons will not be blocked. This allows for external database connections.
