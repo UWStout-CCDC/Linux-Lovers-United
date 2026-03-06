@@ -1,7 +1,7 @@
-# Linux Scripts
+# Linux Lovers United
 #### Authors: Fletcher Meyer and Claude Sonnet 4.6
 
-##  Tools
+## Tools
 Note: Not all malicious or unusual modules are caught with this. Only those with relatively recent modification time. If the attacker has a way of modifying the mtime for a file, this is harder on the administrator's end for identification. 
 These commands require a human in the loop to parse because of the variable nature and necessity of modules.
 
@@ -39,3 +39,8 @@ Runs an NFT script with all necessary ports for scoring inbound allowed and ever
 
 ### weak_db_nft.sh
 Runs an NFT script with all necessary ports for scoring inbound and DNS/HTTP/HTTPS outbound. This is weak as beacons will not be blocked. This allows for external database connections.
+
+
+## Templates
+### Revised IR Template
+Takes the IR Template provided by John Ford to provide more detail, make it fancier, and include resources used for an incident report.
