@@ -5,8 +5,8 @@
 Note: Not all malicious or unusual modules are caught with this. Only those with relatively recent modification time. If the attacker has a way of modifying the mtime for a file, this is harder on the administrator's end for identification. 
 These commands require a human in the loop to parse because of the variable nature and necessity of modules.
 
-### layla.sh
-Actively watches network traffic for any unusual activity. Name comes from "Layla" by Derek and the Dominoe.
+### beacon_monitor.sh
+Actively watches network traffic for any unusual activity. All ports are monitored, but this can be cut down. Encouraged to cut down on unnecessary public facing applications regardless.
 
 ### ldd_report.sh
 Pass a command or path as a parameter. This runs a check on all of the loaded modules for their last modification time. This is useful for identification of newer, unusual modules. 
